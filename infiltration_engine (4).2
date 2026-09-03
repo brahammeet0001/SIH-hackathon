@@ -1,0 +1,688 @@
+"""
+infiltration_engine.py  (v2 - extended)
+
+PS153 - AI-Based Network Attack Forecasting via World Models
+Module owner: Infiltration Prediction Engine & Attack-Stage Mapping
+
+Everything from v1 is preserved (MockWorldModel, predict_rollout,
+map_stage_and_probability, predict_infiltration, LSTMWorldModelAdapter
+stub) so nothing that already worked breaks. New in v2:
+
+  1. BaselineDeviationScorer   - Mahalanobis-distance risk scoring
+     (Section 2 of the architecture doc: "Deviation from Benign
+     Baseline" - this was described in the doc but not yet built).
+  2. predict_infiltration(..., deviation_scorer=...) - optionally
+     blends rule-based probability with baseline-deviation probability
+     into one combined score, instead of relying on rules alone.
+  3. MockWindowedWorldModel + predict_rollout_windowed - a version of
+     the rollout that passes a WINDOW of W past states into
+     model.predict(), matching the real LSTM's expected input shape
+     (S_(t-W) ... S_t) instead of a single last state. Use this
+     contract when wiring in the real checkpoint.
+  4. evaluate_horizon_stability - the "find the optimal K where
+     predictions remain stable" experiment called for in the doc.
+  5. SCENARIOS + run_all_scenarios - one synthetic state per ATT&CK
+     stage (Recon / Initial Access / Lateral Movement / C2 /
+     Exfiltration / Benign) so you can demo and sanity-check every
+     stage label without waiting on real data.
+  6. plot_probability_timeline - quick matplotlib chart, useful for
+     the architecture doc / slides before Streamlit exists.
+
+--------------------------------------------------------------------
+HOW TO SWAP IN THE REAL MODEL LATER
+--------------------------------------------------------------------
+Two possible contracts, pick whichever matches what World Model
+Development actually delivers:
+
+  (a) Single-state model:   predict(state)  -> next_state
+      -> use predict_rollout() / predict_infiltration()  (unchanged)
+
+  (b) Windowed model (matches the architecture doc's notation
+      P(S_t+1 | S_t, S_t-1, ...)):
+                                 predict(window) -> next_state
+      where window.shape == (W, N_FEATURES)
+      -> use predict_rollout_windowed()
+
+Confirm which one your teammate is building BEFORE the swap (see the
+"what to ask your teammate" note at the bottom of this file).
+--------------------------------------------------------------------
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# ============================================================
+# 1. FEATURE SCHEMA
+# ============================================================
+FEATURE_NAMES = [
+    "syn_count", "ack_count", "fin_count", "rst_count", "psh_count",
+    "urg_count", "bytes_per_flow", "packets_per_flow", "flow_duration",
+    "iat_mean", "iat_variance", "iat_max", "unique_dst_ports",
+    "port_scan_rate", "internal_ip_ratio", "ttl_variance", "window_size",
+    "retransmission_count", "beacon_periodicity_score",
+]
+FEATURE_INDEX = {name: i for i, name in enumerate(FEATURE_NAMES)}
+N_FEATURES = len(FEATURE_NAMES)
+
+ATTACK_STAGES = [
+    "Benign", "Reconnaissance", "Initial Access", "Lateral Movement",
+    "Command & Control", "Exfiltration",
+]
+
+
+# ============================================================
+# 2. MOCK WORLD MODELS
+# ============================================================
+
+class MockWorldModel:
+    """Stand-in for the trained single-state world model.
+    Contract: predict(state: (N_FEATURES,)) -> next_state (N_FEATURES,)"""
+
+    def __init__(self, feature_names=FEATURE_NAMES, noise_scale: float = 0.03,
+                 escalation_rate: float = 0.02, seed: Optional[int] = None):
+        self.feature_names = feature_names
+        self.n_features = len(feature_names)
+        self.noise_scale = noise_scale
+        self.escalation_rate = escalation_rate
+        self._rng = np.random.default_rng(seed)
+        self._escalating_features = [
+            "port_scan_rate", "internal_ip_ratio",
+            "beacon_periodicity_score", "retransmission_count",
+        ]
+
+    def predict(self, state: np.ndarray) -> np.ndarray:
+        state = np.asarray(state, dtype=float)
+        if state.shape[0] != self.n_features:
+            raise ValueError(
+                f"MockWorldModel expected state of length {self.n_features}, got {state.shape[0]}"
+            )
+        noise = self._rng.normal(0.0, self.noise_scale, size=state.shape)
+        next_state = state + noise
+        if state.mean() > 0.25:
+            for feat in self._escalating_features:
+                next_state[FEATURE_INDEX[feat]] += self.escalation_rate
+        return np.clip(next_state, 0.0, 1.0)
+
+
+class MockWindowedWorldModel:
+    """Stand-in for a windowed model: predict(window) -> next_state,
+    window.shape == (W, N_FEATURES). Internally just delegates to a
+    MockWorldModel on the last row, but exposes the SHAPE contract
+    the real LSTM will actually use, so downstream code (Streamlit,
+    stage mapping) never has to change when the swap happens."""
+
+    def __init__(self, window_size: int = 5, **kwargs):
+        self.window_size = window_size
+        self._inner = MockWorldModel(**kwargs)
+
+    def predict(self, window: np.ndarray) -> np.ndarray:
+        window = np.asarray(window, dtype=float)
+        if window.ndim != 2 or window.shape[1] != N_FEATURES:
+            raise ValueError(f"expected window shape (W, {N_FEATURES}), got {window.shape}")
+        return self._inner.predict(window[-1])
+
+
+# ============================================================
+# 3. AUTOREGRESSIVE ROLLOUTS
+# ============================================================
+
+def predict_rollout(model, initial_state: np.ndarray, k: int) -> np.ndarray:
+    """Single-state autoregressive rollout (unchanged from v1)."""
+    initial_state = np.asarray(initial_state, dtype=float)
+    if initial_state.shape[0] != N_FEATURES:
+        raise ValueError(f"initial_state must have length {N_FEATURES}, got {initial_state.shape[0]}")
+    if k < 1:
+        raise ValueError("k must be >= 1")
+
+    trajectory = np.zeros((k, N_FEATURES))
+    state = initial_state.copy()
+    for step in range(k):
+        state = model.predict(state)
+        trajectory[step] = state
+    return trajectory
+
+
+def predict_rollout_windowed(model, initial_window: np.ndarray, k: int) -> np.ndarray:
+    """Windowed autoregressive rollout - use this once the real LSTM
+    expects (S_(t-W) ... S_t) rather than a single last state.
+
+    Args:
+        model: exposes predict(window: (W, N_FEATURES)) -> next_state
+        initial_window: np.ndarray shape (W, N_FEATURES), the observed
+            window ending at S_t
+        k: steps to roll forward
+
+    Returns:
+        np.ndarray shape (k, N_FEATURES)
+    """
+    window = np.asarray(initial_window, dtype=float)
+    if window.ndim != 2 or window.shape[1] != N_FEATURES:
+        raise ValueError(f"initial_window must have shape (W, {N_FEATURES}), got {window.shape}")
+    if k < 1:
+        raise ValueError("k must be >= 1")
+
+    trajectory = np.zeros((k, N_FEATURES))
+    for step in range(k):
+        next_state = model.predict(window)
+        trajectory[step] = next_state
+        window = np.vstack([window[1:], next_state[None, :]])  # slide window forward
+    return trajectory
+
+
+# ============================================================
+# 4. BASELINE DEVIATION SCORING  (doc Section 2 - was missing)
+# ============================================================
+
+class BaselineDeviationScorer:
+    """Learns a 'normal traffic' baseline (mean + covariance) and scores
+    how far a projected state deviates from it, via Mahalanobis
+    distance squashed into [0, 1] with a sigmoid. This is the
+    'Deviation from Benign Baseline' step described in the architecture
+    doc, independent of the rule-based stage thresholds.
+
+    Fit this on real benign flows once Data & Feature Engineering
+    hands off a normalised feature matrix. Until then, `fit_default()`
+    gives a reasonable placeholder (mean 0, low variance) so the rest
+    of the pipeline can be built and demoed now.
+    """
+
+    def __init__(self):
+        self.mean: Optional[np.ndarray] = None
+        self.cov_inv: Optional[np.ndarray] = None
+        self._steepness = 6.0   # controls sigmoid sharpness
+        self._midpoint = 3.0    # distance at which score ~= 0.5
+
+    def fit(self, benign_states: np.ndarray) -> "BaselineDeviationScorer":
+        """benign_states: shape (n_samples, N_FEATURES) of KNOWN-benign traffic."""
+        benign_states = np.asarray(benign_states, dtype=float)
+        self.mean = benign_states.mean(axis=0)
+        cov = np.cov(benign_states, rowvar=False)
+        cov += np.eye(N_FEATURES) * 1e-3  # regularise so inversion is stable
+        self.cov_inv = np.linalg.pinv(cov)
+        return self
+
+    def fit_default(self) -> "BaselineDeviationScorer":
+        """Placeholder baseline: benign traffic centred near 0 with mild variance.
+        Swap for fit(real_benign_states) as soon as the real dataset lands."""
+        self.mean = np.zeros(N_FEATURES)
+        self.cov_inv = np.linalg.pinv(np.eye(N_FEATURES) * 0.05)
+        return self
+
+    def mahalanobis(self, state: np.ndarray) -> float:
+        if self.mean is None:
+            raise RuntimeError("Call fit() or fit_default() before scoring.")
+        diff = np.asarray(state, dtype=float) - self.mean
+        d2 = diff @ self.cov_inv @ diff
+        return float(np.sqrt(max(d2, 0.0)))
+
+    def score(self, state: np.ndarray) -> float:
+        """Squash Mahalanobis distance into a [0, 1] risk score."""
+        d = self.mahalanobis(state)
+        return float(1.0 / (1.0 + np.exp(-self._steepness * (d - self._midpoint))))
+
+
+# ============================================================
+# 5. RULE-BASED MITRE ATT&CK STAGE MAPPING  (unchanged from v1)
+# ============================================================
+
+@dataclass
+class StagePrediction:
+    stage: str
+    probability: float
+    triggered_rules: list = field(default_factory=list)
+
+
+# Every gating threshold used below, pulled into one place so a tuning
+# script can sweep them without editing map_stage_and_probability's body.
+# Keys are "<stage>__<feature>" -> the threshold that feature must clear.
+DEFAULT_RULE_THRESHOLDS = {
+    "Reconnaissance__port_scan_rate": 0.5,
+    "Reconnaissance__unique_dst_ports": 0.5,
+    "Initial Access__syn_count": 0.6,
+    "Initial Access__retransmission_count": 0.4,
+    "Lateral Movement__internal_ip_ratio": 0.55,
+    "Lateral Movement__flow_duration": 0.3,
+    "Command & Control__beacon_periodicity_score": 0.6,
+    "Command & Control__bytes_per_flow_max": 0.3,   # gate is "below" this
+    "Exfiltration__bytes_per_flow": 0.7,
+    "Exfiltration__flow_duration": 0.5,
+    "Exfiltration__unique_dst_ports_max": 0.3,       # gate is "below" this
+}
+
+
+def map_stage_and_probability(state: np.ndarray, thresholds: dict = None) -> StagePrediction:
+    """thresholds: optional override dict, same keys as DEFAULT_RULE_THRESHOLDS.
+    Missing keys fall back to the default. Pass a modified copy from a
+    tuning script to sweep sensitivity without touching this function."""
+    t = {**DEFAULT_RULE_THRESHOLDS, **(thresholds or {})}
+    f = {name: state[idx] for name, idx in FEATURE_INDEX.items()}
+    rules_fired: dict = {}
+
+    if f["port_scan_rate"] > t["Reconnaissance__port_scan_rate"] and \
+       f["unique_dst_ports"] > t["Reconnaissance__unique_dst_ports"]:
+        rules_fired["Reconnaissance"] = (f["port_scan_rate"] + f["unique_dst_ports"]) / 2
+
+    if f["syn_count"] > t["Initial Access__syn_count"] and \
+       f["retransmission_count"] > t["Initial Access__retransmission_count"]:
+        rules_fired["Initial Access"] = (f["syn_count"] + f["retransmission_count"]) / 2
+
+    if f["internal_ip_ratio"] > t["Lateral Movement__internal_ip_ratio"] and \
+       f["flow_duration"] > t["Lateral Movement__flow_duration"]:
+        rules_fired["Lateral Movement"] = (f["internal_ip_ratio"] + f["flow_duration"]) / 2
+
+    if f["beacon_periodicity_score"] > t["Command & Control__beacon_periodicity_score"] and \
+       f["bytes_per_flow"] < t["Command & Control__bytes_per_flow_max"]:
+        rules_fired["Command & Control"] = f["beacon_periodicity_score"] * (1 - f["bytes_per_flow"])
+
+    if f["bytes_per_flow"] > t["Exfiltration__bytes_per_flow"] and \
+       f["flow_duration"] > t["Exfiltration__flow_duration"] and \
+       f["unique_dst_ports"] < t["Exfiltration__unique_dst_ports_max"]:
+        rules_fired["Exfiltration"] = (f["bytes_per_flow"] + f["flow_duration"]) / 2
+
+    if not rules_fired:
+        return StagePrediction(stage="Benign", probability=float(state.mean() * 0.3), triggered_rules=[])
+
+    best_stage = max(rules_fired, key=rules_fired.get)
+    probability = float(np.clip(rules_fired[best_stage], 0.0, 1.0))
+    return StagePrediction(stage=best_stage, probability=probability, triggered_rules=list(rules_fired.keys()))
+
+
+# ============================================================
+# 6. MAIN PIPELINE RUNNER
+# ============================================================
+
+def predict_infiltration(
+    initial_state: np.ndarray,
+    k: int = 5,
+    model=None,
+    deviation_scorer: Optional[BaselineDeviationScorer] = None,
+    rule_weight: float = 0.5,
+    alert_threshold: float = 0.6,
+    rule_thresholds: Optional[dict] = None,
+) -> dict:
+    """End-to-end pipeline: rollout -> stage mapping (+ optional
+    baseline-deviation blend) -> clean dict output.
+
+    Args:
+        initial_state: (N_FEATURES,) current observed, normalised state.
+        k: steps to simulate forward.
+        model: exposes .predict(state) -> next_state. Defaults to MockWorldModel().
+        deviation_scorer: optional BaselineDeviationScorer. If given,
+            each step's probability = rule_weight * rule_probability +
+            (1 - rule_weight) * deviation_score, matching the doc's
+            "Trajectory Risk Function" that combines rule/threshold
+            output with distance-from-baseline. If None, behaves
+            exactly like v1 (rules only).
+        rule_weight: blend weight when deviation_scorer is supplied.
+        alert_threshold: probability above which overall_infiltration_flag fires.
+
+    Returns: dict (same shape as v1, unchanged keys) so nothing
+        downstream - Streamlit, explainability - needs to change.
+    """
+    if model is None:
+        model = MockWorldModel()
+
+    initial_state = np.asarray(initial_state, dtype=float)
+    trajectory = predict_rollout(model, initial_state, k)
+
+    timeline = []
+    for step_idx in range(k):
+        state_vec = trajectory[step_idx]
+        prediction = map_stage_and_probability(state_vec, thresholds=rule_thresholds)
+
+        probability = prediction.probability
+        if deviation_scorer is not None:
+            dev_score = deviation_scorer.score(state_vec)
+            probability = rule_weight * prediction.probability + (1 - rule_weight) * dev_score
+
+        timeline.append({
+            "step": step_idx + 1,
+            "probability": round(float(probability), 4),
+            "stage": prediction.stage,
+            "triggered_rules": prediction.triggered_rules,
+            "state": state_vec.round(4).tolist(),
+        })
+
+    probabilities = [entry["probability"] for entry in timeline]
+    max_probability = max(probabilities)
+    final_stage = timeline[-1]["stage"]
+    # The stage at the LAST step isn't necessarily the most informative
+    # label - a trajectory can spike mid-rollout then drift back toward
+    # benign-looking noise by step k (see lateral_movement in the
+    # tuning notes). peak_stage is what the dashboard headline should
+    # actually show; final_stage is kept for anyone who wants the
+    # literal last-step reading.
+    peak_idx = max(range(len(timeline)), key=lambda i: timeline[i]["probability"])
+    peak_stage = timeline[peak_idx]["stage"]
+
+    return {
+        "rollout_length": k,
+        "initial_state": initial_state.round(4).tolist(),
+        "timeline": timeline,
+        "max_probability": round(max_probability, 4),
+        "final_stage": final_stage,
+        "peak_stage": peak_stage,
+        "peak_step": timeline[peak_idx]["step"],
+        "overall_infiltration_flag": max_probability >= alert_threshold,
+    }
+
+
+# ============================================================
+# 7. HORIZON STABILITY EXPERIMENT ("optimal K" - doc requirement)
+# ============================================================
+
+def evaluate_horizon_stability(initial_state: np.ndarray, k_values=(3, 5, 7, 10),
+                                n_trials: int = 20, base_seed: int = 0) -> dict:
+    """Runs many stochastic rollouts per K and measures how much the
+    final predicted state varies. Rising variance with K = compounding
+    error; pick the largest K before variance blows up. This is the
+    experiment the doc explicitly assigns to this role.
+
+    Returns: {k: {"mean_final_variance": float, "mean_max_probability": float}}
+    """
+    results = {}
+    for k in k_values:
+        finals, max_probs = [], []
+        for t in range(n_trials):
+            model = MockWorldModel(seed=base_seed + t)
+            result = predict_infiltration(initial_state, k=k, model=model)
+            finals.append(np.array(result["timeline"][-1]["state"]))
+            max_probs.append(result["max_probability"])
+        finals = np.array(finals)
+        results[k] = {
+            "mean_final_variance": float(finals.var(axis=0).mean()),
+            "mean_max_probability": float(np.mean(max_probs)),
+        }
+    return results
+
+
+# ============================================================
+# 8. MULTI-SCENARIO DEMO HARNESS (one state per ATT&CK stage)
+# ============================================================
+
+SCENARIOS = {
+    "benign": {},
+    "reconnaissance": {"port_scan_rate": 0.6, "unique_dst_ports": 0.65, "syn_count": 0.3},
+    "initial_access": {"syn_count": 0.7, "retransmission_count": 0.5},
+    "lateral_movement": {"internal_ip_ratio": 0.6, "flow_duration": 0.4},
+    "command_and_control": {"beacon_periodicity_score": 0.7, "bytes_per_flow": 0.15},
+    "exfiltration": {"bytes_per_flow": 0.8, "flow_duration": 0.6, "unique_dst_ports": 0.2},
+}
+
+
+def build_scenario_state(name: str) -> np.ndarray:
+    state = np.zeros(N_FEATURES)
+    for feat, val in SCENARIOS[name].items():
+        state[FEATURE_INDEX[feat]] = val
+    return state
+
+
+def run_all_scenarios(k: int = 6, seed: int = 42, use_deviation: bool = True,
+                       rule_weight: float = 0.5, alert_threshold: float = 0.6,
+                       rule_thresholds: Optional[dict] = None) -> dict:
+    """Runs the full pipeline on one synthetic state per stage - a
+    quick way to sanity-check every rule fires correctly, and gives
+    you ready-made clips for the demo video."""
+    scorer = BaselineDeviationScorer().fit_default() if use_deviation else None
+    out = {}
+    for name in SCENARIOS:
+        model = MockWorldModel(seed=seed)
+        state = build_scenario_state(name)
+        out[name] = predict_infiltration(state, k=k, model=model, deviation_scorer=scorer,
+                                          rule_weight=rule_weight, alert_threshold=alert_threshold,
+                                          rule_thresholds=rule_thresholds)
+    return out
+
+
+# ============================================================
+# 9. PLOTTING (for the architecture doc / slides, before Streamlit)
+# ============================================================
+
+def plot_probability_timeline(result: dict, title: str = "Infiltration Probability Timeline",
+                               save_path: Optional[str] = None):
+    import matplotlib.pyplot as plt
+
+    steps = [e["step"] for e in result["timeline"]]
+    probs = [e["probability"] for e in result["timeline"]]
+    stages = [e["stage"] for e in result["timeline"]]
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(steps, probs, marker="o", linewidth=2)
+    ax.axhline(0.6, color="red", linestyle="--", linewidth=1, label="Alert threshold (0.6)")
+    for s, p, st in zip(steps, probs, stages):
+        ax.annotate(st, (s, p), textcoords="offset points", xytext=(0, 10),
+                     fontsize=8, rotation=15, ha="left")
+    ax.set_xlabel("Forecast step (t+k)")
+    ax.set_ylabel("Infiltration probability")
+    ax.set_title(title)
+    ax.set_ylim(0, 1.05)
+    ax.legend(loc="upper left")
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    return fig
+
+
+# ============================================================
+# 10. REAL MODEL ADAPTER (stub - fill in once checkpoint exists)
+# ============================================================
+
+class LSTMWorldModelAdapter:
+    """Fill in once World Model Development delivers a checkpoint.
+    Confirm with them FIRST whether their model is single-state or
+    windowed (see module docstring), then implement the matching
+    contract below."""
+
+    def __init__(self, checkpoint_path: str, window_size: Optional[int] = None):
+        self.checkpoint_path = checkpoint_path
+        self.window_size = window_size
+        raise NotImplementedError(
+            "Fill this in once the real LSTM checkpoint is available. "
+            "Must implement .predict(state_or_window) -> next_state, "
+            "matching either MockWorldModel or MockWindowedWorldModel."
+        )
+
+    def predict(self, state_or_window: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+
+# ============================================================
+# 11. CONTRACT-EXACT INTERFACE
+#     (PS153 Team Build Guide, Section 3 + Section 9)
+# ============================================================
+#
+# The guide's Section 9 integration table is explicit:
+#
+#     forecast(seq, K) -> [(prob, state), ...]
+#
+# and Section 3 spells out the full signature:
+#
+#     forecast(current_window_sequence, steps=K) -> [(prob, predicted_state), ...]
+#
+# This is the ONLY function Utkarsh and Sirjan should import from this
+# file. Everything above (predict_infiltration, map_stage_and_probability,
+# run_all_scenarios, etc.) is yours for testing/tuning/demo prep - do not
+# ship those as the integration point, since stage mapping is Utkarsh's
+# ownership (Section 4), not this module's.
+#
+# NOTE ON NORMALIZATION: this still assumes features arrive roughly in
+# [0, 1] (matches MockWorldModel's clip and BaselineDeviationScorer's
+# fit_default()). CONFIRM with Jeevansh whether he's using min-max
+# (bounded, safe) or z-score (unbounded, would break the clip) before
+# wiring in real data - see the module docstring at the top of this file.
+#
+# NOTE ON HIDDEN STATE: Section 2 says the real World Model exposes a
+# hidden/context state h_t alongside next_state. This interface does not
+# yet capture or forward h_t anywhere - unresolved until you confirm with
+# your World Model teammate whether predict_one_step() returns just
+# next_state, or (next_state, h_t). If it's the latter, extend
+# set_world_model()/forecast() to store and pass h_t through the rollout
+# loop rather than silently dropping it.
+
+_active_model = None  # populate via set_world_model() once the real LSTM checkpoint exists
+
+
+class _CallableModelAdapter:
+    """Wraps a bare predict_one_step(sequence) -> next_state FUNCTION so it
+    satisfies the .predict(window) -> next_state contract predict_rollout_windowed
+    expects. This matters because Section 2's deliverable is literally worded as
+    'a documented predict_one_step(sequence) -> next_state function' - that could
+    be a plain function just as easily as a class method, and set_world_model()
+    needs to work either way without you having to remember to wrap it yourself."""
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def predict(self, window: np.ndarray) -> np.ndarray:
+        return self._fn(window)
+
+
+def set_world_model(model) -> None:
+    """Register the real (or mock) World Model once, so callers of
+    forecast() never need to know a model object exists at all - this
+    is what keeps Utkarsh's and Sirjan's code from having to change when
+    you swap MockWindowedWorldModel for the real LSTM checkpoint.
+
+    Accepts EITHER form your teammate might hand you:
+      - a bare function: predict_one_step(sequence) -> next_state
+      - an object exposing .predict(window) -> next_state
+      - an object exposing .predict_one_step(window) -> next_state
+    and normalizes all three to the internal .predict(window) contract,
+    matching the real predict_one_step(sequence) -> next_state signature
+    from Section 2 of the build guide (windowed input, not single-state -
+    that's the SPEC default; predict_rollout/MockWorldModel above is kept
+    only for standalone single-state testing).
+    """
+    global _active_model
+    if hasattr(model, "predict"):
+        pass  # already satisfies the contract
+    elif hasattr(model, "predict_one_step"):
+        model = _CallableModelAdapter(model.predict_one_step)
+    elif callable(model):
+        model = _CallableModelAdapter(model)
+    else:
+        raise TypeError(
+            "set_world_model() needs a callable, an object with .predict(), "
+            "or an object with .predict_one_step() - got " + type(model).__name__
+        )
+    _active_model = model
+
+
+def forecast(current_window_sequence: np.ndarray, steps: int = 4,
+             deviation_scorer: Optional["BaselineDeviationScorer"] = None):
+    """
+    THE integration-contract function (Section 9 of the build guide).
+    Exact name and shape Utkarsh's stage mapper and Sirjan's dashboard
+    will call directly.
+
+    Args:
+        current_window_sequence: shape (T, N_FEATURES) - the last T
+            observed windows. NOT a single state - matches
+            predict_one_step(sequence)'s expected input.
+        steps: K, number of future windows to forecast. Guide recommends
+            starting at K=4 (default here); our horizon-stability
+            experiment (horizon_experiment.py) found K=7 is the largest
+            horizon that stays stable if you want to push further.
+        deviation_scorer: optional BaselineDeviationScorer for the
+            probability estimate. Defaults to fit_default() if not
+            supplied. Deliberately NOT rule-based (map_stage_and_probability)
+            here, so this module's probability doesn't quietly depend on
+            Utkarsh's not-yet-finalised stage thresholds.
+
+    Returns:
+        [(probability, predicted_state), ...] for step 1..K (t+1..t+K).
+        predicted_state is the raw (N_FEATURES,) np.ndarray - exactly
+        what Utkarsh's map_to_stage(predicted_state) expects as input.
+    """
+    current_window_sequence = np.asarray(current_window_sequence, dtype=float)
+    model = _active_model or MockWindowedWorldModel(window_size=current_window_sequence.shape[0])
+    scorer = deviation_scorer or BaselineDeviationScorer().fit_default()
+
+    trajectory = predict_rollout_windowed(model, current_window_sequence, steps)
+
+    results = []
+    for state_vec in trajectory:
+        prob = scorer.score(state_vec)
+        results.append((round(float(prob), 4), state_vec))
+    return results
+
+
+# ============================================================
+# 12. DEMO / SELF-TEST
+# ============================================================
+
+if __name__ == "__main__":
+    import json
+
+    print("=" * 60)
+    print("1) Single scenario (Reconnaissance) with baseline deviation blend")
+    print("=" * 60)
+    scorer = BaselineDeviationScorer().fit_default()
+    demo_state = build_scenario_state("reconnaissance")
+    mock_model = MockWorldModel(seed=42)
+    result = predict_infiltration(demo_state, k=6, model=mock_model, deviation_scorer=scorer)
+    print(json.dumps(result, indent=2))
+    print(f"\nMax infiltration probability: {result['max_probability']}")
+    print(f"Final predicted stage: {result['final_stage']}")
+    print(f"Alert triggered: {result['overall_infiltration_flag']}")
+
+    print("\n" + "=" * 60)
+    print("2) All scenarios - one state per ATT&CK stage")
+    print("=" * 60)
+    all_results = run_all_scenarios(k=6)
+    for name, res in all_results.items():
+        print(f"{name:22s} -> final_stage={res['final_stage']:20s} "
+              f"max_prob={res['max_probability']:.3f} alert={res['overall_infiltration_flag']}")
+
+    print("\n" + "=" * 60)
+    print("3) Horizon stability experiment (finding optimal K)")
+    print("=" * 60)
+    stability = evaluate_horizon_stability(build_scenario_state("command_and_control"),
+                                            k_values=(3, 5, 7, 10, 15), n_trials=15)
+    for k, stats in stability.items():
+        print(f"K={k:3d}  mean_final_variance={stats['mean_final_variance']:.5f}  "
+              f"mean_max_probability={stats['mean_max_probability']:.3f}")
+
+    print("\n" + "=" * 60)
+    print("4) Windowed rollout sanity check (for when the real LSTM needs a window)")
+    print("=" * 60)
+    window_model = MockWindowedWorldModel(window_size=5, seed=7)
+    initial_window = np.tile(build_scenario_state("exfiltration"), (5, 1))
+    windowed_traj = predict_rollout_windowed(window_model, initial_window, k=5)
+    print(f"Windowed rollout trajectory shape: {windowed_traj.shape}  (expected (5, {N_FEATURES}))")
+
+    print("\n" + "=" * 60)
+    print("5) forecast() - the exact Section 9 contract function")
+    print("=" * 60)
+    seq = np.tile(build_scenario_state("reconnaissance"), (10, 1))  # (T=10, N_FEATURES)
+    result = forecast(seq, steps=4)
+    print(f"Returned {len(result)} tuples (expected steps=4)")
+    for i, (prob, state) in enumerate(result, start=1):
+        assert isinstance(prob, float), "prob must be a float"
+        assert isinstance(state, np.ndarray) and state.shape == (N_FEATURES,), \
+            "predicted_state must be an (N_FEATURES,) ndarray"
+        print(f"  t+{i}: prob={prob}, state.shape={state.shape}")
+    print("forecast() contract verified: [(prob, predicted_state), ...] with float + ndarray types.")
+
+    print("\n" + "=" * 60)
+    print("6) set_world_model() with a BARE FUNCTION (not an object)")
+    print("=" * 60)
+
+    def fake_predict_one_step(sequence: np.ndarray) -> np.ndarray:
+        """Simulates what a teammate might literally hand you per Section 2's
+        wording: 'a documented predict_one_step(sequence) -> next_state function'."""
+        return np.clip(sequence[-1] + 0.01, 0.0, 1.0)
+
+    set_world_model(fake_predict_one_step)
+    result2 = forecast(seq, steps=3)
+    print(f"forecast() with a bare function registered: returned {len(result2)} tuples (expected 3)")
+    for i, (prob, state) in enumerate(result2, start=1):
+        print(f"  t+{i}: prob={prob}, state.shape={state.shape}")
+    set_world_model(MockWindowedWorldModel(window_size=10))  # reset to mock for cleanliness
+    print("set_world_model() handles a bare predict_one_step function correctly.")
+
+    print("\nAll self-tests passed.")
